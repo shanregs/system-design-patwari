@@ -1,0 +1,60 @@
+LB design considerations
+=======================
+load balancing when you're designing or reviewing a system:
+Step 1 → Know your traffic profile.
+Are all requests roughly the same weight? Round-robin is fine. Are some requests 1000x more expensive? You need least-response-time or weighted routing.
+Step 2 → Pick your layer.
+Serving static content + APIs from the same domain? You need L7 to route by path. Pure TCP passthrough for databases or message brokers? L4 is faster and simpler.
+Step 3 → Configure health checks properly.
+Active + passive. Tune the interval. Set a sane failure threshold (3 consecutive failures, not 1). Enable slow-start recovery. Test what happens when a server goes down.
+Step 4 → Monitor the balancer itself.
+Load balancers can become bottlenecks. Track: connection count per backend, request distribution variance, 5xx rate per target, and latency added by the balancer itself.
+Step 5 → Revisit every 6 months.
+Your traffic patterns change. Your server fleet changes. That config you set in January might be completely wrong by July.
+The load balancer is the first thing traffic hits and the last thing most teams think about. Don't be that team.
+
+
+Caching considerations
+--------------------------
+Right. So you've got 5 layers. How do you actually use this?
+Not by turning all of them on and hoping for the best. That's how you get stale data everywhere and zero idea which layer is serving what.
+Here's how I think about it:
+Start from the top. Layer 1 (browser) and Layer 2 (CDN) are the cheapest wins. They require almost no code changes. Just headers.
+Before you add Redis, ask yourself: can I solve this with a Cache-Control header? If your API response doesn't change for 30 seconds, a single header does what Redis would do, with zero infrastructure.
+Only add Layer 3 (Redis) when you need it. Specifically when:
+- The same expensive query runs hundreds of times per second
+- You need to cache computed results (not raw DB rows)
+- You need shared state across multiple app instances (sessions, rate limits)
+- Your database is the bottleneck and you've already optimised queries + added indexes
+Layer 4 and 5, just understand they exist. You won't configure them directly most of the time. But knowing about them explains weird stuff. Like why a query is fast the second time. Or why your database gets slow when someone runs a batch job on the same server.
+The question to ask for each piece of data:
+1. How often does this change?
+2. How many people see the exact same version?
+3. What's the cost of showing stale data for 30 seconds?
+If it changes rarely, lots of people see the same thing, and 30 seconds of staleness doesn't matter? Cache it as close to the user as possible.
+If it changes constantly, is unique per user, and staleness = lost money? Don't cache it. Just make the query fast.
+Everything else falls somewhere in between. And that's where your judgment as an engineer matters.
+Quick cheat sheet:
+Scenario → Best layer
+1) Static assets (CSS/JS/images) → Browser + CDN
+2) API response same for everyone → CDN (short TTL)
+3) Expensive computed result → Redis
+4) Frequently accessed DB rows → Redis + DB shared buffers
+5) User session data → Redis
+6) Data that must be real-time → Don't cache. Optimise the query.
+
+
+
+
+CDN  design considertaions
+-----------------------
+1. What's the read-to-write ratio? If it's anywhere near 100:1 (most systems), the CDN is your most important layer. Full stop.
+2. Classify content by change frequency:
+- Never changes → long TTL
+- Changes hourly → short TTL + stale-while-revalidate
+- Changes per-request → don't cache (or cache per-cohort)
+3. Measure cache hit ratio every week. Below 85%? You're leaving free performance on the table.
+4. Move read-heavy, latency-sensitive logic to the edge. Auth checks. Geo-routing. Response transforms.
+A CDN is not something you bolt on when the site gets slow. It's architecture decision you make on day one.
+
+

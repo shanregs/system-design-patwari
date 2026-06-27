@@ -16,45 +16,122 @@ The load balancer is the first thing traffic hits and the last thing most teams 
 
 Caching considerations
 --------------------------
-Right. So you've got 5 layers. How do you actually use this?
-Not by turning all of them on and hoping for the best. That's how you get stale data everywhere and zero idea which layer is serving what.
-Here's how I think about it:
-Start from the top. Layer 1 (browser) and Layer 2 (CDN) are the cheapest wins. They require almost no code changes. Just headers.
-Before you add Redis, ask yourself: can I solve this with a Cache-Control header? If your API response doesn't change for 30 seconds, a single header does what Redis would do, with zero infrastructure.
-Only add Layer 3 (Redis) when you need it. Specifically when:
-- The same expensive query runs hundreds of times per second
-- You need to cache computed results (not raw DB rows)
-- You need shared state across multiple app instances (sessions, rate limits)
-- Your database is the bottleneck and you've already optimised queries + added indexes
-Layer 4 and 5, just understand they exist. You won't configure them directly most of the time. But knowing about them explains weird stuff. Like why a query is fast the second time. Or why your database gets slow when someone runs a batch job on the same server.
-The question to ask for each piece of data:
-1. How often does this change?
-2. How many people see the exact same version?
-3. What's the cost of showing stale data for 30 seconds?
-If it changes rarely, lots of people see the same thing, and 30 seconds of staleness doesn't matter? Cache it as close to the user as possible.
-If it changes constantly, is unique per user, and staleness = lost money? Don't cache it. Just make the query fast.
-Everything else falls somewhere in between. And that's where your judgment as an engineer matters.
-Quick cheat sheet:
-Scenario → Best layer
-1) Static assets (CSS/JS/images) → Browser + CDN
-2) API response same for everyone → CDN (short TTL)
-3) Expensive computed result → Redis
-4) Frequently accessed DB rows → Redis + DB shared buffers
-5) User session data → Redis
-6) Data that must be real-time → Don't cache. Optimise the query.
+	So you've got 5 layers. How do you actually use this?
+	Not by turning all of them on and hoping for the best. That's how you get stale data everywhere and zero idea which layer is serving what.
+	Here's how I think about it:
+	Start from the top. Layer 1 (browser) and Layer 2 (CDN) are the cheapest wins. They require almost no code changes. Just headers.
+	Before you add Redis, ask yourself: can I solve this with a Cache-Control header? If your API response doesn't change for 30 seconds, a single header does what Redis would do, with zero infrastructure.
+	Only add Layer 3 (Redis) when you need it. Specifically when:
+		- The same expensive query runs hundreds of times per second
+		- You need to cache computed results (not raw DB rows)
+		- You need shared state across multiple app instances (sessions, rate limits)
+		- Your database is the bottleneck and you've already optimised queries + added indexes
+	Layer 4 (Database ) and 5(OS Hoot pages cache in RAM), just understand they exist. You won't configure them directly most of the time. But knowing about them explains weird stuff. Like why a query is fast the second time. Or why your database gets slow when someone runs a batch job on the same server.
+		The question to ask for each piece of data:
+		1. How often does this change?
+		2. How many people see the exact same version?
+		3. What's the cost of showing stale data for 30 seconds?
+	If it changes rarely, lots of people see the same thing, and 30 seconds of staleness doesn't matter? Cache it as close to the user as possible.
+	If it changes constantly, is unique per user, and staleness = lost money? Don't cache it. Just make the query fast.
+	Everything else falls somewhere in between. And that's where your judgment as an engineer matters.
+	
+	Quick cheat sheet:
+		Scenario → Best layer
+		1) Static assets (CSS/JS/images) → Browser + CDN
+		2) API response same for everyone → CDN (short TTL)
+		3) Expensive computed result → Redis
+		4) Frequently accessed DB rows → Redis + DB shared buffers
+		5) User session data → Redis
+		6) Data that must be real-time → Don't cache. Optimise the query.
 
 
 
 
-CDN  design considertaions
+CDN  design considerations
 -----------------------
-1. What's the read-to-write ratio? If it's anywhere near 100:1 (most systems), the CDN is your most important layer. Full stop.
-2. Classify content by change frequency:
-- Never changes → long TTL
-- Changes hourly → short TTL + stale-while-revalidate
-- Changes per-request → don't cache (or cache per-cohort)
-3. Measure cache hit ratio every week. Below 85%? You're leaving free performance on the table.
-4. Move read-heavy, latency-sensitive logic to the edge. Auth checks. Geo-routing. Response transforms.
-A CDN is not something you bolt on when the site gets slow. It's architecture decision you make on day one.
+	1. What's the read-to-write ratio? If it's anywhere near 100:1 (most systems), the CDN is your most important layer. Full stop.
+	2. Classify content by change frequency:
+	- Never changes → long TTL
+	- Changes hourly → short TTL + stale-while-revalidate
+	- Changes per-request → don't cache (or cache per-cohort)
+	3. Measure cache hit ratio every week. Below 85%? You're leaving free performance on the table.
+	4. Move read-heavy, latency-sensitive logic to the edge. Auth checks. Geo-routing. Response transforms.
+	A CDN is not something you bolt on when the site gets slow. It's architecture decision you make on day one.
 
+
+Cache Invalidation
+------------------
+Quick decision cheat sheet:
+
+	Format: What you're caching → Strategy → Invalidation
+
+	1) Product listings → Write-around → TTL (30-60s)
+	2) User sessions → Write-through → TTL (30 min)
+	3) Analytics counters → Write-behind → TTL (short)
+	4) Inventory / pricing → Write-through → Event-driven
+	5) Feature flags → Write-around → TTL (5 min)
+	6) User permissions → Write-through → Event-driven
+
+
+Rate Limitter considerations
+---------------------------
+	Honestly, for most APIs: token bucket. It handles real-world traffic patterns (which are naturally bursty) without being overly strict.
+	Sliding window if you need strict per-window limits (auth endpoints, payment APIs).
+	Leaky bucket if you need perfectly smooth throughput (rate-sensitive downstream systems)
+
+	Most teams slap rate limiting at the API gateway and call it done. That's one layer. Production systems need at least two. Here's why.
+	Layer 1: API Gateway (the front door)
+		This is your first line of defense. Every request passes through here. Set global rate limits: "no client can exceed 1000 requests per minute."
+
+		This catches:
+		- Runaway scripts
+		- Misconfigured clients
+		- Basic abuse
+		- Your own batch jobs (ask me how I know)
+
+		Tools: Kong, NGINX, AWS API Gateway, Cloudflare. All have rate limiting built in.
+
+	Layer 2: Per-service limits (noisy neighbour protection)
+		You have 10 microservices. Your search service can handle 5000 rps. Your export service can handle 50.
+		Without per-service limits, one client hammering /export at 200 rps takes that service down. And because /export is down, health checks fail, the circuit breaker trips, and suddenly other things start breaking too.
+		Per-service rate limits prevent one endpoint from eating the capacity of another.
+	Layer 3: Per-user limits (fair usage)
+		One user is making 10,000 API calls per minute. Every other user is making 50. Without per-user limits, that one power user is consuming 99% of your capacity.
+		Per-user limits: "each API key gets 100 requests per minute." Fair. Predictable. No single user can starve everyone else.
+		This is also where you differentiate pricing tiers. Free tier: 100 rpm. Pro: 1000 rpm. Enterprise: 10,000 rpm. Rate limiting is literally your pricing enforcement.
+	Layer 4: Per-endpoint limits (not all endpoints are equal)
+		Your /search endpoint can handle 10,000 rps. It's fast, cached, lightweight.
+		Your /generate-report endpoint does a 30-second database aggregation. It can handle maybe 10 concurrent requests before the database starts crying.
+		Same global rate limit for both? That's a disaster waiting to happen. The heavy endpoints need tighter limits.
+	The rule: at minimum, use two layers. Gateway-level for global protection. Per-endpoint or per-user for granular control.
+
+	A client hits the limit. Now what?
+		This part matters more than people think. A bad rate limit response turns a small problem into a much bigger one.
+		The basics: 429 Too Many Requests
+		When a client exceeds the limit, return HTTP 429. Not 500. Not 503. Specifically 429. It tells the client "you sent too many requests" which is very different from "the server is broken."
+		Always include these headers in the response:
+		- X-RateLimit-Limit: 100 (your max per window)
+		- X-RateLimit-Remaining: 0 (how many left)
+		- Retry-After: 30 (when to try again, in seconds)
+
+	Quick decision cheat sheet:
+
+		- Endpoint type → Algorithm → Limit example
+		- Public API → Token bucket → 100 rpm per API key
+		- Login/auth → Sliding window → 5 attempts per minute
+		- Search → Token bucket → 30 rps per user
+		- Heavy export/report → Leaky bucket → 2 concurrent per user
+		- Webhooks (outgoing) → Leaky bucket → Constant 50 per second
+		- Internal service-to-service → Token bucket → 5000 rps per service
+
+API gateway
+-----------
+	- Authentication
+	- Rate limiting
+	- Logging
+	- CORS
+	- Request validation
+	- Protocol translation
+	
+	
 
